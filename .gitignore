@@ -1,0 +1,11 @@
+# 运行时与构建产物
+widget_state.json
+widget_state.backup.json
+__pycache__/
+build/
+dist/
+*.spec
+
+# 系统
+Thumbs.db
+desktop.ini
