@@ -141,7 +141,7 @@ python -m pip install pyinstaller
 
 ## 版本与更新
 
-当前版本 **v3.0.0**。发布版本在 [Releases](https://github.com/Bin-1011/clash-desktop-widget/releases)，
+当前版本 **v3.0.1**。发布版本在 [Releases](https://github.com/Bin-1011/clash-desktop-widget/releases)，
 程序里「设置 → 关于 → 检查更新」会读取 GitHub 最新 Release 并对比版本号。
 
 ## License

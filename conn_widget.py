@@ -33,7 +33,7 @@ import winreg
 from tkinter import colorchooser
 from tkinter import font as tkfont
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 APP_REPO = "Bin-1011/clash-desktop-widget"
 APP_AUTHOR = "Bin-1011"
 APP_NAME = "Clash 连接小窗"
@@ -898,6 +898,10 @@ class Poller(threading.Thread):
 # ---------------------------------------------------------------- 托盘
 WM_TRAY = 0x0400 + 20
 WM_HOTKEY = 0x0312
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 WM_LBUTTONUP, WM_RBUTTONUP, WM_LBUTTONDBLCLK = 0x0202, 0x0205, 0x0203
 NIM_ADD, NIM_DELETE = 0, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
@@ -932,6 +936,7 @@ class TrayIcon:
         self.on_click = on_click
         self.on_menu = on_menu
         self.on_maximize = None
+        self.pending = None
         try:
             user32 = ctypes.windll.user32
             user32.SetWindowLongPtrW.restype = ctypes.c_void_p
@@ -973,27 +978,31 @@ class TrayIcon:
             ev = lparam & 0xFFFF
             try:
                 if ev in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-                    self.root.after(0, self.on_click)
+                    self.pending = "toggle"
                 elif ev == WM_RBUTTONUP:
-                    self.root.after(0, self.on_menu)
+                    self.pending = "menu"
             except Exception:
                 pass
             return 0
         if msg == 0x0112 and (wparam & 0xFFF0) == 0xF030:   # WM_SYSCOMMAND / SC_MAXIMIZE
             try:
                 if getattr(self, "on_maximize", None):
-                    self.root.after(0, self.on_maximize)
+                    self.pending = "maximize"
             except Exception:
                 pass
             return 0
         if msg == WM_HOTKEY:
             try:
                 if self._hotkey_cb:
-                    self.root.after(0, self._hotkey_cb)
+                    self.pending = "hotkey"
             except Exception:
                 pass
             return 0
         return ctypes.windll.user32.CallWindowProcW(self._old, hwnd, msg, wparam, lparam)
+
+    def take(self):
+        ev, self.pending = self.pending, None
+        return ev
 
     def register_hotkey(self, cb, vk=ord("C")):
         """Ctrl+Shift+C 呼出/隐藏（纯 RegisterHotKey，无需第三方库）。"""
@@ -1088,7 +1097,7 @@ class ConnWidget:
         self._place_window()
         self._apply_collapsed()
         self.root.after(30, self._round_corners)
-        self.root.after(120, self._drain)
+        self._job_drain = self.root.after(120, self._drain)
 
         self.poller = Poller(prof["api"], prof["secret"], float(cfg["interval"]), self.q)
         self.poller.start()
@@ -1099,7 +1108,7 @@ class ConnWidget:
 
         if not cfg.get("first_run_done"):
             self.root.after(400, self.show_wizard)
-        self.root.after(3000, self._watch_system_theme)
+        self._job_theme = self.root.after(3000, self._watch_system_theme)
 
     # ------------------------------------------------------------ 基础
     def t(self, key, **kw):
@@ -2311,7 +2320,7 @@ class ConnWidget:
                     self._refresh_settings()
         except Exception:
             pass
-        self.root.after(3000, self._watch_system_theme)
+        self._job_theme = self.root.after(3000, self._watch_system_theme)
 
     def set_lang(self, v):
         self.cfg["lang"] = v
@@ -2614,7 +2623,7 @@ class ConnWidget:
             pass
         if latest is not None:
             self._on_data(latest)
-        self.root.after(150, self._drain)
+        self._job_drain = self.root.after(150, self._drain)
 
     def _on_data(self, d):
         c = self.c
@@ -3153,19 +3162,42 @@ class ConnWidget:
             self.root.withdraw()
 
     def _tray_menu(self):
-        c = self.c
-        m = tk.Menu(self.root, **self._menu_colors())
-        hidden = self.root.state() == "withdrawn"
-        m.add_command(label=self.t("tray_show") if hidden else self.t("tray_hide"),
-                      command=self._tray_toggle)
-        m.add_command(label=self.t("menu_settings"), command=self._tray_settings)
-        m.add_command(label=self.t("menu_open"), command=self.open_panel)
-        m.add_separator()
-        m.add_command(label=self.t("tray_quit"), command=self.quit_app)
+        """托盘右键菜单（Tk 菜单）。WNDPROC 只置标记，不在这里回调 Tk。"""
         try:
+            if getattr(self, "_ctx_menu", None):
+                try:
+                    self._ctx_menu.unpost()
+                    self._ctx_menu.destroy()
+                except Exception:
+                    pass
+            m = tk.Menu(self.root, **self._menu_colors())
+            hidden = self.root.state() == "withdrawn"
+            m.add_command(label=self.t("tray_show") if hidden else self.t("tray_hide"),
+                          command=self._tray_toggle)
+            m.add_command(label=self.t("menu_settings"), command=self._tray_settings)
+            m.add_command(label=self.t("menu_open"), command=self.open_panel)
+            m.add_separator()
+            m.add_command(label=self.t("tray_quit"), command=self.quit_app)
+            self._ctx_menu = m
             m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
-        finally:
-            m.grab_release()
+        except Exception:
+            pass
+
+    def _poll_tray(self):
+        ev = None
+        try:
+            ev = self.tray.take() if self.tray else None
+        except Exception:
+            ev = None
+        if ev == "toggle":
+            self._tray_toggle()
+        elif ev == "hotkey":
+            self._tray_toggle()
+        elif ev == "menu":
+            self._tray_menu()
+        elif ev == "maximize":
+            self.toggle_collapse()
+        self._job_poll = self.root.after(90, self._poll_tray)
 
     def _tray_settings(self):
         self.show_window()
@@ -3184,6 +3216,19 @@ class ConnWidget:
         self.quit_app()
 
     def quit_app(self):
+        # 菜单还开着时先收起，延迟一帧再真正退出，避免 Tk 抓取未释放导致卡住
+        if getattr(self, "_ctx_menu", None):
+            try:
+                self._ctx_menu.unpost()
+                self._ctx_menu.destroy()
+            except Exception:
+                pass
+            self._ctx_menu = None
+            self.root.after(120, self._do_quit)
+            return
+        self._do_quit()
+
+    def _do_quit(self):
         try:
             self._persist()
         except Exception:
@@ -3203,6 +3248,21 @@ class ConnWidget:
                     w.destroy()
             except Exception:
                 pass
+        for jid in (getattr(self, "_job_drain", None), getattr(self, "_job_theme", None),
+                    getattr(self, "_job_poll", None)):
+            try:
+                if jid:
+                    self.root.after_cancel(jid)
+            except Exception:
+                pass
+        try:
+            self.root.grab_release()
+        except Exception:
+            pass
+        try:
+            self.root.quit()        # 先结束 mainloop，再销毁，避免菜单抓取未释放时卡住
+        except Exception:
+            pass
         try:
             self.root.destroy()
         except Exception:
@@ -3211,6 +3271,7 @@ class ConnWidget:
     def run(self):
         self.root.deiconify()
         self._init_tray()
+        self._job_poll = self.root.after(90, self._poll_tray)
         self.root.mainloop()
 
 
