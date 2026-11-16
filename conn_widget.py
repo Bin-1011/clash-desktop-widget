@@ -14,6 +14,7 @@ Clash / Mihomo 桌面连接小窗 v2
 import argparse
 import base64
 import ctypes
+import http.client
 import json
 import os
 import queue
@@ -29,7 +30,10 @@ import tkinter as tk
 import urllib.error
 import urllib.parse
 import urllib.request
-import winreg
+try:
+    import winreg
+except ImportError:  # 非 Windows：主题跟随与注册表相关功能走各自的失败分支
+    winreg = None
 from tkinter import colorchooser
 from tkinter import font as tkfont
 
@@ -214,6 +218,7 @@ I18N = {
         "diag_not_clash": "该地址不是 Clash 接口（HTTP 404），检查端口或路径前缀",
         "diag_timeout": "连接超时：检查 IP、端口、防火墙与 external-controller 是否 0.0.0.0",
         "diag_refused": "端口拒绝连接：服务未启动或端口写错",
+        "diag_badurl": "地址无效：去掉空格，并带上 http:// 或 https://",
         "diag_net": "网络错误：{msg}", "diag_http": "接口返回 HTTP {code}",
         "diag_other": "错误：{msg}", "retry_hint": "点「设置」检查地址与 Secret",
         "sort_speed": "速率", "sort_host": "主机", "sort_node": "节点", "sort_time": "时间",
@@ -277,6 +282,7 @@ I18N = {
         "diag_not_clash": "Not a Clash API (HTTP 404) — check port / path prefix",
         "diag_timeout": "Timed out — check IP, port, firewall and external-controller 0.0.0.0",
         "diag_refused": "Connection refused — service down or wrong port",
+        "diag_badurl": "Invalid URL — remove spaces and include http:// or https://",
         "diag_net": "Network error: {msg}", "diag_http": "HTTP {code}",
         "diag_other": "Error: {msg}", "retry_hint": "Open Settings to fix URL / secret",
         "sort_speed": "Speed", "sort_host": "Host", "sort_node": "Node", "sort_time": "Time",
@@ -444,6 +450,10 @@ def autostart_file() -> str:
 
 
 def set_autostart(flag: bool) -> bool:
+    # 开机启动项目录来自 Windows 的 APPDATA。没有这个环境变量时不要在当前目录
+    # 造出一个相对路径的 Startup 文件夹。
+    if not os.environ.get("APPDATA"):
+        return False
     p = autostart_file()
     try:
         if flag:
@@ -600,6 +610,9 @@ class Poller(threading.Thread):
 
     @staticmethod
     def _classify(exc):
+        # Python 3 的 urlopen 超时直接抛 TimeoutError，不是 URLError。
+        if isinstance(exc, TimeoutError):
+            return "timeout", str(exc)[:80]
         if isinstance(exc, urllib.error.HTTPError):
             if exc.code in (401, 403):
                 return "auth", f"HTTP {exc.code}"
@@ -607,13 +620,18 @@ class Poller(threading.Thread):
                 return "not_clash", "HTTP 404"
             return "http", f"HTTP {exc.code}"
         if isinstance(exc, urllib.error.URLError):
-            reason = str(exc.reason)
-            low = reason.lower()
+            reason = exc.reason
+            if isinstance(reason, TimeoutError):
+                return "timeout", str(reason)[:80]
+            text = str(reason)
+            low = text.lower()
             if "timed out" in low or "timeout" in low:
-                return "timeout", reason[:80]
+                return "timeout", text[:80]
             if "refused" in low or "10061" in low:
-                return "refused", reason[:80]
-            return "net", reason[:80]
+                return "refused", text[:80]
+            return "net", text[:80]
+        if isinstance(exc, http.client.InvalidURL):
+            return "badurl", str(exc)[:80]
         return "other", str(exc)[:80]
 
     # ------------------------------------------------------------ 状态
@@ -1304,6 +1322,8 @@ class ConnWidget:
 
         # 视图切换
         self.tabs = tk.Frame(self.outer, bg=c["bg"], height=self.TABS_H)
+        # 高度必须和 _win_h 里预留的 TABS_H 一致，否则少 1px 就会整行画不出来。
+        self.tabs.pack_propagate(False)
         self._build_tabs()
 
         # 迷你模式
@@ -1322,6 +1342,7 @@ class ConnWidget:
 
         # 搜索栏
         self.search_bar = tk.Frame(self.outer, bg=c["bg"], height=self.SEARCH_H)
+        self.search_bar.pack_propagate(False)
         self.search_var = tk.StringVar(master=self.root, value="")
         self.search_entry = tk.Entry(self.search_bar, textvariable=self.search_var,
                                      font=self.f_ui, bg=c["input_bg"], fg=c["title"],
@@ -1466,11 +1487,7 @@ class ConnWidget:
             m.add_command(label=self.t("only_node"),
                           command=lambda: (self.toggle_search(True),
                                            self.search_var.set(row["node"])))
-        self._row_menu_ref = m
-        try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
+        self._popup_menu(m, e.x_root, e.y_root)
 
     def _create_grips(self):
         self._grips = []
@@ -1619,8 +1636,12 @@ class ConnWidget:
                        else (r["src"] or "—"))
                 a = agg.get(key)
                 if a is None:
+                    # 节点视图的键就是节点名；不能一律标成直连，否则详情会把代理节点显示成「直连」。
+                    is_direct = view == "node" and (key == self.t("direct") or key.upper() == "DIRECT")
                     a = agg[key] = {
-                        "id": key, "host": key, "node": "", "direct": True,
+                        "id": key, "host": key,
+                        "node": "" if is_direct or view != "node" else key,
+                        "direct": is_direct,
                         "agg": True, "count": 0, "up": 0.0, "down": 0.0,
                         "up_total": 0.0, "down_total": 0.0, "src": r["src"],
                         "rule": "", "net": "", "sport": "", "chain": "",
@@ -1635,9 +1656,17 @@ class ConnWidget:
             rows = list(agg.values())
             if q:
                 rows = [r for r in rows if q in r["host"].lower()]
-            if self.cfg.get("sort") == "host":
-                rows.sort(key=lambda r: r["host"].lower(),
-                          reverse=self.cfg.get("sort_desc", True))
+            mode = self.cfg.get("sort", "speed")
+            desc = self.cfg.get("sort_desc", True)
+            if mode == "host":
+                rows.sort(key=lambda r: r["host"].lower(), reverse=desc)
+            elif mode == "node":
+                # 汇总视图第二列是连接数，点它应按条数排，而不是退回总速率。
+                rows.sort(key=lambda r: (r["count"], r["down"] + r["up"]), reverse=desc)
+            elif mode == "down":
+                rows.sort(key=lambda r: r["down"], reverse=desc)
+            elif mode == "up":
+                rows.sort(key=lambda r: r["up"], reverse=desc)
             else:
                 rows.sort(key=lambda r: (-(r["down"] + r["up"]), -r["hot"]))
             return rows
@@ -1647,6 +1676,10 @@ class ConnWidget:
             rows = sorted(rows, key=lambda r: r["host"].lower(), reverse=desc)
         elif mode == "node":
             rows = sorted(rows, key=lambda r: (r["node"] or " ").lower(), reverse=desc)
+        elif mode == "down":
+            rows = sorted(rows, key=lambda r: r["down"], reverse=desc)
+        elif mode == "up":
+            rows = sorted(rows, key=lambda r: r["up"], reverse=desc)
         elif mode == "time":
             rows = sorted(rows, key=lambda r: r["start"], reverse=desc)
         return rows
@@ -1729,12 +1762,20 @@ class ConnWidget:
                            font=fs, anchor="w")
             x += self.EXTRA_W[k]
             cv.create_line(x, self.S(4), x, self.HEADER_H - self.S(4), fill=c["border"])
-        # 排序列提示
+        # 排序列提示。速率列右对齐，箭头放在列内左侧，避免盖住数字表头。
         arrow = "▼" if self.cfg.get("sort_desc", True) else "▲"
-        pos = {"host": (self.PAD_L, "w"), "node": (x_node, "w")}.get(
-            self.cfg.get("sort", "speed"))
-        if pos:
-            cv.create_text(pos[0] + self.S(34), y, text=arrow, fill=c["accent"],
+        sort = self.cfg.get("sort", "speed")
+        if sort == "host":
+            cv.create_text(self.PAD_L + self.S(34), y, text=arrow, fill=c["accent"],
+                           font=self.f_small, anchor="w")
+        elif sort == "node":
+            cv.create_text(x_node + self.S(34), y, text=arrow, fill=c["accent"],
+                           font=self.f_small, anchor="w")
+        elif sort in ("speed", "down"):
+            cv.create_text(x_down + self.S(2), y, text=arrow, fill=c["accent"],
+                           font=self.f_small, anchor="w")
+        elif sort == "up":
+            cv.create_text(x_up + self.S(2), y, text=arrow, fill=c["accent"],
                            font=self.f_small, anchor="w")
         for xx in (x_node, x_down, x_up):
             cv.create_line(xx, self.S(4), xx, self.HEADER_H - self.S(4),
@@ -1800,13 +1841,24 @@ class ConnWidget:
                                fill=c["sub"], font=self.f_small, anchor="w")
                 x += self.EXTRA_W[k]
 
+    def _sb_bounds(self, w):
+        """滑块避开无边框模式右侧的拉伸手柄，否则手柄会把滚动手势吃掉。"""
+        grip = 0 if getattr(self, "native", False) else self.S(6)
+        x1 = max(self.S(12), w - grip)
+        x0 = max(0, x1 - self.S(10))
+        return x0, x1
+
+    def _in_scrollbar(self, x, w):
+        x0, x1 = self._sb_bounds(w)
+        return x0 <= x <= x1
+
     def _draw_scrollbar(self, w, h, vis, n):
         if self.cfg["rows"] != "all" or n <= vis:
             return
         c = self.c
         if not (self.sb_hover or self.sb_drag):
             return
-        track_x = w - self.S(6)
+        track_x = self._sb_bounds(w)[0]
         top = self.HEADER_H + self.S(2)
         bottom = h - self.S(2)
         self.table.create_rectangle(track_x, top, track_x + self.S(4), bottom,
@@ -1868,7 +1920,7 @@ class ConnWidget:
     def _on_motion(self, e):
         idx = self._row_at(e.y)
         w = self.table.winfo_width()
-        on_sb = (self.cfg["rows"] == "all" and e.x >= w - self.S(8))
+        on_sb = (self.cfg["rows"] == "all" and self._in_scrollbar(e.x, w))
         changed = False
         if on_sb != self.sb_hover:
             self.sb_hover = on_sb
@@ -1902,7 +1954,7 @@ class ConnWidget:
 
     def _on_press(self, e):
         w = self.table.winfo_width()
-        if self.cfg["rows"] == "all" and e.x >= w - self.S(8) and e.y > self.HEADER_H:
+        if self.cfg["rows"] == "all" and self._in_scrollbar(e.x, w) and e.y > self.HEADER_H:
             self.sb_drag = e.y
             self._scroll_to_y(e.y, dragging=True)
             return
@@ -1920,7 +1972,9 @@ class ConnWidget:
             elif e.x < x_down:
                 key = "node"
             elif e.x < x_up:
-                key = "speed"
+                key = "down"
+            elif e.x < x_up + self.COL_UP_W:
+                key = "up"
             if key:
                 self._set_sort(key)
             return
@@ -2123,11 +2177,24 @@ class ConnWidget:
         m.add_separator()
         m.add_command(label=self.t("menu_settings"), command=self.open_settings)
         m.add_command(label=self.t("menu_quit"), command=self.quit_app)
-        self._row_menu = m
+        self._popup_menu(m, e.x_root, e.y_root)
+
+    def _popup_menu(self, menu, x, y):
+        """弹出菜单。
+
+        Windows 上 ``tk_popup`` 里的 post 会阻塞到菜单关闭，返回后要放开 grab。
+        X11 上 ``tk_popup`` 立刻返回，并且刚刚装上的全局 grab 就是菜单能收到点击、
+        以及点外面/Esc 能收起的原因；马上 grab_release 会把菜单留在屏幕上且点不到。
+        """
+        self._ctx_menu = menu
         try:
-            m.tk_popup(e.x_root, e.y_root)
+            menu.tk_popup(x, y)
         finally:
-            m.grab_release()
+            try:
+                if str(menu.tk.call("tk", "windowingsystem")) != "x11":
+                    menu.grab_release()
+            except Exception:
+                pass
 
     def _ip_text(self):
         ip = self.cfg.get("filter_ip") or ""
@@ -2149,11 +2216,7 @@ class ConnWidget:
         for ip, n in ips:
             m.add_command(label=("✓ " if ip == cur else "   ") + f"{ip}  ({n})",
                           command=lambda i=ip: self.set_filter(i))
-        self._row_menu = m
-        try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
+        self._popup_menu(m, e.x_root, e.y_root)
 
     def _show_profile_menu(self, e):
         m = tk.Menu(self.root, **self._menu_colors())
@@ -2163,11 +2226,7 @@ class ConnWidget:
                           command=lambda i=i: self.set_profile(i))
         m.add_separator()
         m.add_command(label=self.t("menu_settings"), command=self.open_settings)
-        self._row_menu = m
-        try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
+        self._popup_menu(m, e.x_root, e.y_root)
 
     # ------------------------------------------------------------ 动作
     def set_filter(self, ip):
@@ -2498,10 +2557,10 @@ class ConnWidget:
                  font=self.f_h2).pack(anchor="w", padx=self.S(14), pady=(self.S(10), self.S(4)))
         rows = [
             (self.t("d_host"), row["host"]),
-            (self.t("d_node"), self.t("direct") if row["direct"] else row["node"]),
+            (self.t("d_node"), self.t("direct") if row["direct"] else (row.get("node") or "—")),
             (self.t("d_chain"), row.get("chain") or "—"),
             (self.t("d_rule"), row.get("rule") or "—"),
-            (self.t("d_src"), f'{row["src"]}:{row["sport"]}' if row["src"] else "—"),
+            (self.t("d_src"), (f'{row["src"]}:{row["sport"]}' if row.get("sport") else row["src"]) if row.get("src") else "—"),
             (self.t("d_net"), row.get("net") or "—"),
             (self.t("d_data"), f'↓{fmt_short(row["down_total"])}  ↑{fmt_short(row["up_total"])}'),
         ]
@@ -3178,8 +3237,7 @@ class ConnWidget:
             m.add_command(label=self.t("menu_open"), command=self.open_panel)
             m.add_separator()
             m.add_command(label=self.t("tray_quit"), command=self.quit_app)
-            self._ctx_menu = m
-            m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+            self._popup_menu(m, self.root.winfo_pointerx(), self.root.winfo_pointery())
         except Exception:
             pass
 
