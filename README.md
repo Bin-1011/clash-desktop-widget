@@ -90,7 +90,7 @@ pythonw conn_widget.py --api http://192.168.50.1:9999 --secret your-secret
 - **列表**：显示行数（含不限）、刷新频率、列显示开关（规则/来源/协议）
 - **行为**：置顶、启动时折叠、关闭收进托盘、开机自启
 - **语言**：中文 / English
-- **关于**：版本、数据源、内核版本
+- **关于**：版本、仓库地址（可点击）、作者、运行环境、数据源与内核版本，以及「检查更新」
 
 ## 实时性
 
@@ -138,6 +138,11 @@ python -m pip install pyinstaller
 | `启动小窗.vbs` / `创建桌面快捷方式.ps1` | 启动器 / 快捷方式 |
 | `app.ico` / `make_icon.ps1` / `build.ps1` | 图标与构建脚本 |
 | `widget_state.json` | 运行时配置（自动生成，已 gitignore） |
+
+## 版本与更新
+
+当前版本 **v3.0.0**。发布版本在 [Releases](https://github.com/Bin-1011/clash-desktop-widget/releases)，
+程序里「设置 → 关于 → 检查更新」会读取 GitHub 最新 Release 并对比版本号。
 
 ## License
 
