@@ -6,6 +6,9 @@ build/
 dist/
 *.spec
 
+# 发布二进制走 GitHub Releases，不纳入仓库
+ClashConnWidget.exe
+
 # 系统
 Thumbs.db
 desktop.ini

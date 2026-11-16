@@ -5,7 +5,7 @@
 每秒刷新、按速率排序，点一下就能看规则 / 链路 / 来源；支持任意后台地址、多配置档、
 不限行数滚动、按节点和设备汇总、搜索排序、托盘常驻，也能打包成免 Python 的单文件 exe。
 
-![精修风格](screenshot_polish.png)
+![精修风格](docs/images/screenshot_polish.png)
 
 ## 特性
 
@@ -38,23 +38,25 @@
 
 | 精修（默认） | 仪表盘 |
 |---|---|
-| ![polish](screenshot_polish.png) | ![dash](screenshot_dash.png) |
+| ![polish](docs/images/screenshot_polish.png) | ![dash](docs/images/screenshot_dash.png) |
 
 | 节点汇总视图 | 设置 |
 |---|---|
-| ![views](screenshot_v3.png) | ![settings](screenshot_settings.png) |
+| ![views](docs/images/screenshot_v3.png) | ![settings](docs/images/screenshot_settings.png) |
 
 | 窗口外壳：左=无边框，右=系统窗口 |
 |---|
-| ![shell](screenshot_compare.png) |
+| ![shell](docs/images/screenshot_compare.png) |
 
 ## 快速开始
 
+从 [Releases](https://github.com/Bin-1011/clash-desktop-widget/releases) 下载 `ClashConnWidget.exe`（当前 v3.0.1 约 12.6 MB），放到本目录后双击即可，不用安装 Python。仓库不再附带这个 exe。
+
 | 方式 | 说明 |
 | --- | --- |
-| 双击 `ClashConnWidget.exe` | 单文件打包版，不用装 Python（约 12.6 MB） |
-| 双击 `启动小窗.vbs` | 有 exe 用 exe，否则 `pythonw conn_widget.py` |
-| `创建桌面快捷方式.ps1` | 在桌面生成带图标的快捷方式 |
+| 双击 `ClashConnWidget.exe` | 从 Releases 下载的单文件打包版，不用装 Python |
+| 双击 `启动小窗.vbs` | 同目录有 exe 时启动 exe；没有 exe 时回退到 `pythonw conn_widget.py` |
+| `创建桌面快捷方式.ps1` | 在桌面生成带图标的快捷方式（有 exe 指向 exe，否则指向 `pythonw conn_widget.py`） |
 
 首次启动会弹出引导：填 Clash 外部控制器地址（如 `http://192.168.50.1:9999`），
 点「自动检测」可自动找本机 / 网关上的常见端口。
@@ -83,7 +85,7 @@ pythonw conn_widget.py --api http://192.168.50.1:9999 --secret your-secret
 
 ## 设置
 
-![settings](screenshot_settings.png)
+![settings](docs/images/screenshot_settings.png)
 
 - **后台连接**：配置档增删切换、名称/地址/Secret、测试连接、自动检测
 - **外观**：主题、强调色、风格、窗口外壳、字号、不透明度、重置窗口宽度/列宽
@@ -129,14 +131,17 @@ python -m pip install pyinstaller
 .\build.ps1
 ```
 
+`build.ps1` 会把 `ClashConnWidget.exe` 复制到仓库根目录，供 `启动小窗.vbs` 优先启动。该文件已加入 `.gitignore`，发布时请上传到对应版本的 [Releases](https://github.com/Bin-1011/clash-desktop-widget/releases)，不要提交进 git。
+
 ## 文件
 
 | 文件 | 作用 |
 | --- | --- |
-| `ClashConnWidget.exe` | 单文件打包版 |
+| `ClashConnWidget.exe` | 单文件打包版。从 [Releases](https://github.com/Bin-1011/clash-desktop-widget/releases) 下载，或本地 `.\build.ps1` 生成；不在仓库里 |
 | `conn_widget.py` | 源码（约 3000 行） |
-| `启动小窗.vbs` / `创建桌面快捷方式.ps1` | 启动器 / 快捷方式 |
-| `app.ico` / `make_icon.ps1` / `build.ps1` | 图标与构建脚本 |
+| `启动小窗.vbs` / `创建桌面快捷方式.ps1` | 启动器 / 快捷方式。有 exe 用 exe，否则 `pythonw conn_widget.py` |
+| `app.ico` / `make_icon.ps1` / `build.ps1` | 图标与构建脚本。`make_icon.ps1` 的预览图写到 `docs/images/app_preview.png` |
+| `docs/images/` | README 截图与图标预览 |
 | `widget_state.json` | 运行时配置（自动生成，已 gitignore） |
 
 ## 版本与更新

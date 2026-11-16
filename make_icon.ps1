@@ -4,7 +4,9 @@ Add-Type -AssemblyName System.Drawing
 
 $outDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $icoPath = Join-Path $outDir 'app.ico'
-$previewPath = Join-Path $outDir 'app_preview.png'
+$previewDir = Join-Path $outDir 'docs\images'
+if (-not (Test-Path $previewDir)) { New-Item -ItemType Directory -Path $previewDir | Out-Null }
+$previewPath = Join-Path $previewDir 'app_preview.png'
 
 function New-RoundPath([single]$x, [single]$y, [single]$w, [single]$h, [single]$r) {
     $p = New-Object System.Drawing.Drawing2D.GraphicsPath
