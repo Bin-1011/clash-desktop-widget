@@ -14,6 +14,7 @@ Clash / Mihomo 桌面连接小窗 v2
 import argparse
 import base64
 import ctypes
+import http.client
 import json
 import os
 import queue
@@ -29,7 +30,10 @@ import tkinter as tk
 import urllib.error
 import urllib.parse
 import urllib.request
-import winreg
+try:
+    import winreg
+except ImportError:  # 非 Windows：主题跟随与注册表相关功能走各自的失败分支
+    winreg = None
 from tkinter import colorchooser
 from tkinter import font as tkfont
 
@@ -37,6 +41,15 @@ VERSION = "3.0.1"
 APP_REPO = "Bin-1011/clash-desktop-widget"
 APP_AUTHOR = "Bin-1011"
 APP_NAME = "Clash 连接小窗"
+
+# Clash API 通常在局域网，必须直连，不能继承 HTTP(S)_PROXY 等系统代理设置。
+# 「检查更新」访问 GitHub，仍使用默认的 urllib.request.urlopen（走系统代理）。
+API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def api_urlopen(req, timeout=3.0):
+    """访问 Clash API 专用：不读取环境中的 HTTP(S)_PROXY。"""
+    return API_OPENER.open(req, timeout=timeout)
 
 
 def app_dir() -> str:
@@ -183,6 +196,9 @@ I18N = {
         "rows": "显示行数", "interval": "刷新频率",
         "topmost": "窗口置顶", "collapse_start": "启动时折叠",
         "close_to_tray": "关闭收进托盘", "autostart": "开机自启",
+        "autostart_fail": "开机自启设置失败：APPDATA 不可用或启动目录不可写。",
+        "hotkey_fail": "Ctrl+Shift+C 热键注册失败：可能被其他程序占用，请从托盘菜单操作。",
+        "save_fail": "配置保存失败：目录只读或没有权限，设置可能不会被记住（{path}）。",
         "on": "开", "off": "关", "small": "小", "normal": "标准", "large": "大",
         "rows_n": "{n} 行", "rows_all": "不限", "sec": "{v} 秒",
         "polish": "精修", "dash": "仪表盘",
@@ -214,6 +230,7 @@ I18N = {
         "diag_not_clash": "该地址不是 Clash 接口（HTTP 404），检查端口或路径前缀",
         "diag_timeout": "连接超时：检查 IP、端口、防火墙与 external-controller 是否 0.0.0.0",
         "diag_refused": "端口拒绝连接：服务未启动或端口写错",
+        "diag_badurl": "地址无效：去掉空格，并带上 http:// 或 https://",
         "diag_net": "网络错误：{msg}", "diag_http": "接口返回 HTTP {code}",
         "diag_other": "错误：{msg}", "retry_hint": "点「设置」检查地址与 Secret",
         "sort_speed": "速率", "sort_host": "主机", "sort_node": "节点", "sort_time": "时间",
@@ -246,6 +263,9 @@ I18N = {
         "rows": "Visible rows", "interval": "Refresh rate",
         "topmost": "Always on top", "collapse_start": "Start collapsed",
         "close_to_tray": "Close to tray", "autostart": "Run at startup",
+        "autostart_fail": "Could not update the startup entry: APPDATA is unavailable or the Startup folder is not writable.",
+        "hotkey_fail": "Could not register the Ctrl+Shift+C hotkey: another app may be using it. Use the tray menu instead.",
+        "save_fail": "Could not save settings (read-only folder or no permission); changes may not be remembered: {path}",
         "on": "On", "off": "Off", "small": "Small", "normal": "Normal", "large": "Large",
         "rows_n": "{n} rows", "rows_all": "All", "sec": "{v}s",
         "polish": "Polished", "dash": "Dashboard",
@@ -277,6 +297,7 @@ I18N = {
         "diag_not_clash": "Not a Clash API (HTTP 404) — check port / path prefix",
         "diag_timeout": "Timed out — check IP, port, firewall and external-controller 0.0.0.0",
         "diag_refused": "Connection refused — service down or wrong port",
+        "diag_badurl": "Invalid URL — remove spaces and include http:// or https://",
         "diag_net": "Network error: {msg}", "diag_http": "HTTP {code}",
         "diag_other": "Error: {msg}", "retry_hint": "Open Settings to fix URL / secret",
         "sort_speed": "Speed", "sort_host": "Host", "sort_node": "Node", "sort_time": "Time",
@@ -293,6 +314,14 @@ I18N = {
 
 
 # ---------------------------------------------------------------- 工具
+def hotkey_fail_message(ok, lang="zh"):
+    """热键注册成功返回 None；失败返回对应语言的可见提示。"""
+    if ok:
+        return None
+    table = I18N.get(lang) or I18N["zh"]
+    return table.get("hotkey_fail", I18N["zh"]["hotkey_fail"])
+
+
 def dpi_scale() -> float:
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -339,6 +368,23 @@ def fmt_time(seconds: float) -> str:
     if s < 86400:
         return f"{s // 3600}h {(s % 3600) // 60}m"
     return f"{s // 86400}d {(s % 86400) // 3600}h"
+
+
+def wheel_steps(event) -> int:
+    """滚轮步数：正数向上、负数向下；兼容 Windows delta 与 X11 Button-4/5。"""
+    delta = getattr(event, "delta", 0) or 0
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        delta = 0
+    if delta:
+        return delta // 120
+    num = getattr(event, "num", None)
+    if num == 4:
+        return 1
+    if num == 5:
+        return -1
+    return 0
 
 
 def norm_api(text: str) -> str:
@@ -427,14 +473,62 @@ def load_cfg() -> dict:
     return cfg
 
 
-def save_cfg(cfg: dict) -> None:
+LAST_SAVE_ERROR = None
+
+
+def save_cfg(cfg: dict) -> bool:
+    """保存配置；成功返回 True，失败返回 False 并把异常留在 LAST_SAVE_ERROR。"""
+    global LAST_SAVE_ERROR
+    tmp = CONFIG_FILE + ".tmp"
     try:
-        tmp = CONFIG_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, ensure_ascii=False, indent=2)
         os.replace(tmp, CONFIG_FILE)
-    except Exception:
-        pass
+    except Exception as exc:
+        LAST_SAVE_ERROR = exc
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return False
+    LAST_SAVE_ERROR = None
+    return True
+
+
+def save_error_key(err) -> str:
+    """把保存错误归一成用于去重的键。"""
+    if err is None:
+        return "unknown"
+    return f"{type(err).__name__}: {err}"[:300]
+
+
+def should_report_save_error(prev_key, err) -> bool:
+    """同一错误已经提示过就返回 False；成功时应把 prev_key 重置为 None。"""
+    return save_error_key(err) != prev_key
+
+
+class SaveErrorNotifier:
+    """保存失败提示去重：同一错误只报一次，保存成功后重置。"""
+
+    def __init__(self):
+        self._key = None
+
+    def note(self, ok: bool, err=None) -> bool:
+        if ok:
+            self._key = None
+            return False
+        if not should_report_save_error(self._key, err):
+            return False
+        self._key = save_error_key(err)
+        return True
+
+
+_SAVE_ERROR_NOTIFIER = SaveErrorNotifier()
+
+
+def note_save_result(ok: bool, err=None) -> bool:
+    """模块级便捷入口，语义同 SaveErrorNotifier.note。"""
+    return _SAVE_ERROR_NOTIFIER.note(ok, err)
 
 
 def autostart_file() -> str:
@@ -443,7 +537,19 @@ def autostart_file() -> str:
                         "Startup", "ClashConnWidget.vbs")
 
 
+def build_autostart_vbs(cmd: str) -> str:
+    """生成启动 VBS 正文。cmd 已带引号，VBScript 中需把每个引号写成两个，
+    再在整体外面包一对引号（即三引号形式）。"""
+    vbs_arg = '"' + cmd.replace('"', '""') + '"'
+    return ('Set sh = CreateObject("WScript.Shell")\r\n'
+            f'sh.Run {vbs_arg}, 0, False\r\n')
+
+
 def set_autostart(flag: bool) -> bool:
+    # 开机启动项目录来自 Windows 的 APPDATA。没有这个环境变量时不要在当前目录
+    # 造出一个相对路径的 Startup 文件夹。
+    if not os.environ.get("APPDATA"):
+        return False
     p = autostart_file()
     try:
         if flag:
@@ -451,16 +557,29 @@ def set_autostart(flag: bool) -> bool:
                 cmd = f'"{sys.executable}"'
             else:
                 cmd = f'"{sys.executable}" "{os.path.join(app_dir(), "conn_widget.py")}"'
-            content = ('Set sh = CreateObject("WScript.Shell")\r\n'
-                       f'sh.Run "{cmd.replace(chr(34), chr(34)*2)}", 0, False\r\n')
+            content = build_autostart_vbs(cmd)
             os.makedirs(os.path.dirname(p), exist_ok=True)
-            with open(p, "w", encoding="utf-8") as fh:
+            with open(p, "w", encoding="utf-16") as fh:  # UTF-16 LE + BOM
                 fh.write(content)
         elif os.path.exists(p):
             os.remove(p)
         return True
     except Exception:
         return False
+
+
+def apply_autostart_flag(cfg: dict, flag: bool) -> bool:
+    """应用开机自启开关；失败时把 cfg 恢复为关闭，避免 UI 仍显示「开」。"""
+    ok = set_autostart(bool(flag))
+    cfg["autostart"] = bool(flag) if ok else False
+    return ok
+
+
+def refresh_autostart_if_enabled(cfg: dict) -> bool:
+    """启动时若配置为开启，按当前 exe / 脚本路径重写 VBS（应对程序被移动）。"""
+    if not cfg.get("autostart"):
+        return False
+    return apply_autostart_flag(cfg, True)
 
 
 def system_dark() -> bool:
@@ -490,20 +609,61 @@ def gateway_ip() -> str:
     return ""
 
 
+def classify_http_error(exc):
+    """把网络异常归类为 (kind, detail)；HTTP 状态码的 detail 只保留数字。"""
+    # Python 3 的 urlopen 超时直接抛 TimeoutError，不是 URLError。
+    if isinstance(exc, TimeoutError):
+        return "timeout", str(exc)[:80]
+    if isinstance(exc, urllib.error.HTTPError):
+        code = str(exc.code)
+        if exc.code in (401, 403):
+            return "auth", code
+        if exc.code == 404:
+            return "not_clash", code
+        return "http", code
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, TimeoutError):
+            return "timeout", str(reason)[:80]
+        text = str(reason)
+        low = text.lower()
+        if "timed out" in low or "timeout" in low:
+            return "timeout", text[:80]
+        if "refused" in low or "10061" in low:
+            return "refused", text[:80]
+        return "net", text[:80]
+    if isinstance(exc, (http.client.InvalidURL, ValueError)):
+        return "badurl", str(exc)[:80]
+    return "other", str(exc)[:80]
+
+
+def format_probe_result(result, lang="zh") -> str:
+    """把 probe_api 的结果格式化成用户可见的测试连接文案。"""
+    table = I18N.get(lang) or I18N["zh"]
+    if result and result[0]:
+        ver = result[1] if len(result) > 1 else "?"
+        return table["test_ok"].format(ver=ver)
+    kind = result[1] if result and len(result) > 1 else "other"
+    detail = result[2] if result and len(result) > 2 else ""
+    template = table.get("diag_" + kind) or table["diag_other"]
+    return template.format(msg=detail, code=detail)
+
+
 def probe_api(base: str, secret: str, timeout: float = 0.6):
-    """探测一个地址，返回 (api, version) 或 None。"""
+    """探测一个地址：成功返回 (api, version)，失败返回 (None, kind, detail)。"""
     base = norm_api(base)
     if not base:
-        return None
+        return None, "badurl", "empty address"
     try:
         req = urllib.request.Request(base + "/version")
         if secret:
             req.add_header("Authorization", "Bearer " + secret)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with api_urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         return base, str(data.get("version") or data.get("meta") and "mihomo" or "clash")
-    except Exception:
-        return None
+    except Exception as exc:
+        kind, detail = classify_http_error(exc)
+        return None, kind, detail
 
 
 def discover_backends() -> list:
@@ -517,7 +677,7 @@ def discover_backends() -> list:
 
     def work(h, p):
         r = probe_api(f"http://{h}:{p}", "", 0.5)
-        if r:
+        if r and r[0]:
             with lock:
                 if r[0] not in [x[0] for x in found]:
                     found.append(r)
@@ -595,26 +755,12 @@ class Poller(threading.Thread):
         req = urllib.request.Request(api + path)
         if secret:
             req.add_header("Authorization", "Bearer " + secret)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with api_urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
 
     @staticmethod
     def _classify(exc):
-        if isinstance(exc, urllib.error.HTTPError):
-            if exc.code in (401, 403):
-                return "auth", f"HTTP {exc.code}"
-            if exc.code == 404:
-                return "not_clash", "HTTP 404"
-            return "http", f"HTTP {exc.code}"
-        if isinstance(exc, urllib.error.URLError):
-            reason = str(exc.reason)
-            low = reason.lower()
-            if "timed out" in low or "timeout" in low:
-                return "timeout", reason[:80]
-            if "refused" in low or "10061" in low:
-                return "refused", reason[:80]
-            return "net", reason[:80]
-        return "other", str(exc)[:80]
+        return classify_http_error(exc)
 
     # ------------------------------------------------------------ 状态
     def _reset_state(self):
@@ -927,11 +1073,17 @@ class NOTIFYICONDATAW(ctypes.Structure):
     ]
 
 
+def tray_should_readd(msg, taskbar_created_id):
+    """explorer 重启后收到的 TaskbarCreated 才需要重建托盘图标。"""
+    return bool(taskbar_created_id) and msg == taskbar_created_id
+
+
 class TrayIcon:
     """纯 ctypes 的托盘图标（Shell_NotifyIcon + 窗口过程钩子）。"""
 
     def __init__(self, root, icon_path, on_click, on_menu, tip=APP_NAME):
         self.ok = False
+        self.taskbar_created = 0
         self.root = root
         self.on_click = on_click
         self.on_menu = on_menu
@@ -939,6 +1091,11 @@ class TrayIcon:
         self.pending = None
         try:
             user32 = ctypes.windll.user32
+            try:
+                self.taskbar_created = int(
+                    user32.RegisterWindowMessageW("TaskbarCreated") or 0)
+            except Exception:
+                self.taskbar_created = 0
             user32.SetWindowLongPtrW.restype = ctypes.c_void_p
             user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                                  ctypes.c_void_p]
@@ -947,6 +1104,12 @@ class TrayIcon:
                                                ctypes.c_uint, ctypes.c_size_t,
                                                ctypes.c_ssize_t]
             self.hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+            if self.taskbar_created:
+                try:
+                    user32.ChangeWindowMessageFilterEx(
+                        self.hwnd, self.taskbar_created, 1, None)  # MSGFLT_ALLOW
+                except Exception:
+                    pass
             self.hicon = 0
             if icon_path and os.path.exists(icon_path):
                 self.hicon = ctypes.windll.user32.LoadImageW(
@@ -974,6 +1137,9 @@ class TrayIcon:
             self.ok = False
 
     def _handler(self, hwnd, msg, wparam, lparam):
+        if tray_should_readd(msg, self.taskbar_created):
+            self.readd()
+            return 0
         if msg == WM_TRAY:
             ev = lparam & 0xFFFF
             try:
@@ -1003,6 +1169,15 @@ class TrayIcon:
     def take(self):
         ev, self.pending = self.pending, None
         return ev
+
+    def readd(self):
+        """explorer 重启后按原 nid 重新添加托盘图标（可在 wndproc 中直接调用）。"""
+        try:
+            self.ok = bool(ctypes.windll.shell32.Shell_NotifyIconW(
+                NIM_ADD, ctypes.byref(self.nid)))
+        except Exception:
+            self.ok = False
+        return self.ok
 
     def register_hotkey(self, cb, vk=ord("C")):
         """Ctrl+Shift+C 呼出/隐藏（纯 RegisterHotKey，无需第三方库）。"""
@@ -1036,6 +1211,7 @@ class TrayIcon:
 class ConnWidget:
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        refresh_autostart_if_enabled(self.cfg)
         self.theme_name = self._resolved_theme()
         self.c = self._palette()
         self.st = STYLES[cfg["style"]]
@@ -1055,7 +1231,11 @@ class ConnWidget:
         self.details_row = None
         self._set_win = None
         self._wizard = None
+        self._settings_error = ""
+        self._save_error = ""
+        self._save_notifier = SaveErrorNotifier()
         self.tray = None
+        self.hotkey_ok = False
         self._save_job = None
         self._cdrag = None
         self._rsz = None
@@ -1304,6 +1484,8 @@ class ConnWidget:
 
         # 视图切换
         self.tabs = tk.Frame(self.outer, bg=c["bg"], height=self.TABS_H)
+        # 高度必须和 _win_h 里预留的 TABS_H 一致，否则少 1px 就会整行画不出来。
+        self.tabs.pack_propagate(False)
         self._build_tabs()
 
         # 迷你模式
@@ -1322,6 +1504,7 @@ class ConnWidget:
 
         # 搜索栏
         self.search_bar = tk.Frame(self.outer, bg=c["bg"], height=self.SEARCH_H)
+        self.search_bar.pack_propagate(False)
         self.search_var = tk.StringVar(master=self.root, value="")
         self.search_entry = tk.Entry(self.search_bar, textvariable=self.search_var,
                                      font=self.f_ui, bg=c["input_bg"], fg=c["title"],
@@ -1344,6 +1527,8 @@ class ConnWidget:
         self.table.bind("<Double-Button-1>", self._on_double)
         self.table.bind("<Button-3>", self._on_menu)
         self.table.bind("<MouseWheel>", self._on_wheel)
+        self.table.bind("<Button-4>", self._on_wheel)
+        self.table.bind("<Button-5>", self._on_wheel)
 
         for w in (head, self.lbl_dot, self.lbl_title, self.lbl_count, self.lbl_down,
                   self.lbl_up, self.outer):
@@ -1466,11 +1651,7 @@ class ConnWidget:
             m.add_command(label=self.t("only_node"),
                           command=lambda: (self.toggle_search(True),
                                            self.search_var.set(row["node"])))
-        self._row_menu_ref = m
-        try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
+        self._popup_menu(m, e.x_root, e.y_root)
 
     def _create_grips(self):
         self._grips = []
@@ -1619,8 +1800,12 @@ class ConnWidget:
                        else (r["src"] or "—"))
                 a = agg.get(key)
                 if a is None:
+                    # 节点视图的键就是节点名；不能一律标成直连，否则详情会把代理节点显示成「直连」。
+                    is_direct = view == "node" and (key == self.t("direct") or key.upper() == "DIRECT")
                     a = agg[key] = {
-                        "id": key, "host": key, "node": "", "direct": True,
+                        "id": key, "host": key,
+                        "node": "" if is_direct or view != "node" else key,
+                        "direct": is_direct,
                         "agg": True, "count": 0, "up": 0.0, "down": 0.0,
                         "up_total": 0.0, "down_total": 0.0, "src": r["src"],
                         "rule": "", "net": "", "sport": "", "chain": "",
@@ -1635,9 +1820,17 @@ class ConnWidget:
             rows = list(agg.values())
             if q:
                 rows = [r for r in rows if q in r["host"].lower()]
-            if self.cfg.get("sort") == "host":
-                rows.sort(key=lambda r: r["host"].lower(),
-                          reverse=self.cfg.get("sort_desc", True))
+            mode = self.cfg.get("sort", "speed")
+            desc = self.cfg.get("sort_desc", True)
+            if mode == "host":
+                rows.sort(key=lambda r: r["host"].lower(), reverse=desc)
+            elif mode == "node":
+                # 汇总视图第二列是连接数，点它应按条数排，而不是退回总速率。
+                rows.sort(key=lambda r: (r["count"], r["down"] + r["up"]), reverse=desc)
+            elif mode == "down":
+                rows.sort(key=lambda r: r["down"], reverse=desc)
+            elif mode == "up":
+                rows.sort(key=lambda r: r["up"], reverse=desc)
             else:
                 rows.sort(key=lambda r: (-(r["down"] + r["up"]), -r["hot"]))
             return rows
@@ -1647,6 +1840,10 @@ class ConnWidget:
             rows = sorted(rows, key=lambda r: r["host"].lower(), reverse=desc)
         elif mode == "node":
             rows = sorted(rows, key=lambda r: (r["node"] or " ").lower(), reverse=desc)
+        elif mode == "down":
+            rows = sorted(rows, key=lambda r: r["down"], reverse=desc)
+        elif mode == "up":
+            rows = sorted(rows, key=lambda r: r["up"], reverse=desc)
         elif mode == "time":
             rows = sorted(rows, key=lambda r: r["start"], reverse=desc)
         return rows
@@ -1729,12 +1926,20 @@ class ConnWidget:
                            font=fs, anchor="w")
             x += self.EXTRA_W[k]
             cv.create_line(x, self.S(4), x, self.HEADER_H - self.S(4), fill=c["border"])
-        # 排序列提示
+        # 排序列提示。速率列右对齐，箭头放在列内左侧，避免盖住数字表头。
         arrow = "▼" if self.cfg.get("sort_desc", True) else "▲"
-        pos = {"host": (self.PAD_L, "w"), "node": (x_node, "w")}.get(
-            self.cfg.get("sort", "speed"))
-        if pos:
-            cv.create_text(pos[0] + self.S(34), y, text=arrow, fill=c["accent"],
+        sort = self.cfg.get("sort", "speed")
+        if sort == "host":
+            cv.create_text(self.PAD_L + self.S(34), y, text=arrow, fill=c["accent"],
+                           font=self.f_small, anchor="w")
+        elif sort == "node":
+            cv.create_text(x_node + self.S(34), y, text=arrow, fill=c["accent"],
+                           font=self.f_small, anchor="w")
+        elif sort in ("speed", "down"):
+            cv.create_text(x_down + self.S(2), y, text=arrow, fill=c["accent"],
+                           font=self.f_small, anchor="w")
+        elif sort == "up":
+            cv.create_text(x_up + self.S(2), y, text=arrow, fill=c["accent"],
                            font=self.f_small, anchor="w")
         for xx in (x_node, x_down, x_up):
             cv.create_line(xx, self.S(4), xx, self.HEADER_H - self.S(4),
@@ -1800,13 +2005,24 @@ class ConnWidget:
                                fill=c["sub"], font=self.f_small, anchor="w")
                 x += self.EXTRA_W[k]
 
+    def _sb_bounds(self, w):
+        """滑块避开无边框模式右侧的拉伸手柄，否则手柄会把滚动手势吃掉。"""
+        grip = 0 if getattr(self, "native", False) else self.S(6)
+        x1 = max(self.S(12), w - grip)
+        x0 = max(0, x1 - self.S(10))
+        return x0, x1
+
+    def _in_scrollbar(self, x, w):
+        x0, x1 = self._sb_bounds(w)
+        return x0 <= x <= x1
+
     def _draw_scrollbar(self, w, h, vis, n):
         if self.cfg["rows"] != "all" or n <= vis:
             return
         c = self.c
         if not (self.sb_hover or self.sb_drag):
             return
-        track_x = w - self.S(6)
+        track_x = self._sb_bounds(w)[0]
         top = self.HEADER_H + self.S(2)
         bottom = h - self.S(2)
         self.table.create_rectangle(track_x, top, track_x + self.S(4), bottom,
@@ -1868,7 +2084,7 @@ class ConnWidget:
     def _on_motion(self, e):
         idx = self._row_at(e.y)
         w = self.table.winfo_width()
-        on_sb = (self.cfg["rows"] == "all" and e.x >= w - self.S(8))
+        on_sb = (self.cfg["rows"] == "all" and self._in_scrollbar(e.x, w))
         changed = False
         if on_sb != self.sb_hover:
             self.sb_hover = on_sb
@@ -1902,7 +2118,7 @@ class ConnWidget:
 
     def _on_press(self, e):
         w = self.table.winfo_width()
-        if self.cfg["rows"] == "all" and e.x >= w - self.S(8) and e.y > self.HEADER_H:
+        if self.cfg["rows"] == "all" and self._in_scrollbar(e.x, w) and e.y > self.HEADER_H:
             self.sb_drag = e.y
             self._scroll_to_y(e.y, dragging=True)
             return
@@ -1920,7 +2136,9 @@ class ConnWidget:
             elif e.x < x_down:
                 key = "node"
             elif e.x < x_up:
-                key = "speed"
+                key = "down"
+            elif e.x < x_up + self.COL_UP_W:
+                key = "up"
             if key:
                 self._set_sort(key)
             return
@@ -1974,9 +2192,12 @@ class ConnWidget:
     def _on_wheel(self, e):
         if self.cfg["rows"] != "all":
             return
+        steps = wheel_steps(e)
+        if not steps:
+            return
         vis = max(1, (self.table.winfo_height() - self.HEADER_H) // self.ROW_H)
         max_scroll = max(0, len(self.rows_visible) - vis)
-        self.scroll = max(0, min(max_scroll, self.scroll - (e.delta // 120) * 3))
+        self.scroll = max(0, min(max_scroll, self.scroll - steps * 3))
         self._redraw()
 
     def _scroll_to_y(self, y, dragging=False):
@@ -2123,11 +2344,24 @@ class ConnWidget:
         m.add_separator()
         m.add_command(label=self.t("menu_settings"), command=self.open_settings)
         m.add_command(label=self.t("menu_quit"), command=self.quit_app)
-        self._row_menu = m
+        self._popup_menu(m, e.x_root, e.y_root)
+
+    def _popup_menu(self, menu, x, y):
+        """弹出菜单。
+
+        Windows 上 ``tk_popup`` 里的 post 会阻塞到菜单关闭，返回后要放开 grab。
+        X11 上 ``tk_popup`` 立刻返回，并且刚刚装上的全局 grab 就是菜单能收到点击、
+        以及点外面/Esc 能收起的原因；马上 grab_release 会把菜单留在屏幕上且点不到。
+        """
+        self._ctx_menu = menu
         try:
-            m.tk_popup(e.x_root, e.y_root)
+            menu.tk_popup(x, y)
         finally:
-            m.grab_release()
+            try:
+                if str(menu.tk.call("tk", "windowingsystem")) != "x11":
+                    menu.grab_release()
+            except Exception:
+                pass
 
     def _ip_text(self):
         ip = self.cfg.get("filter_ip") or ""
@@ -2149,11 +2383,7 @@ class ConnWidget:
         for ip, n in ips:
             m.add_command(label=("✓ " if ip == cur else "   ") + f"{ip}  ({n})",
                           command=lambda i=ip: self.set_filter(i))
-        self._row_menu = m
-        try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
+        self._popup_menu(m, e.x_root, e.y_root)
 
     def _show_profile_menu(self, e):
         m = tk.Menu(self.root, **self._menu_colors())
@@ -2163,11 +2393,7 @@ class ConnWidget:
                           command=lambda i=i: self.set_profile(i))
         m.add_separator()
         m.add_command(label=self.t("menu_settings"), command=self.open_settings)
-        self._row_menu = m
-        try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
+        self._popup_menu(m, e.x_root, e.y_root)
 
     # ------------------------------------------------------------ 动作
     def set_filter(self, ip):
@@ -2349,9 +2575,17 @@ class ConnWidget:
         self._refresh_settings()
 
     def set_bool(self, key, v):
-        self.cfg[key] = bool(v)
         if key == "autostart":
-            set_autostart(bool(v))
+            ok = apply_autostart_flag(self.cfg, bool(v))
+            if ok:
+                self._settings_error = ""
+            else:
+                self._settings_error = self.t("autostart_fail")
+                self._toast(self._settings_error)
+            self._persist()
+            self._refresh_settings()
+            return
+        self.cfg[key] = bool(v)
         self._persist()
         self._refresh_settings()
 
@@ -2498,10 +2732,10 @@ class ConnWidget:
                  font=self.f_h2).pack(anchor="w", padx=self.S(14), pady=(self.S(10), self.S(4)))
         rows = [
             (self.t("d_host"), row["host"]),
-            (self.t("d_node"), self.t("direct") if row["direct"] else row["node"]),
+            (self.t("d_node"), self.t("direct") if row["direct"] else (row.get("node") or "—")),
             (self.t("d_chain"), row.get("chain") or "—"),
             (self.t("d_rule"), row.get("rule") or "—"),
-            (self.t("d_src"), f'{row["src"]}:{row["sport"]}' if row["src"] else "—"),
+            (self.t("d_src"), (f'{row["src"]}:{row["sport"]}' if row.get("sport") else row["src"]) if row.get("src") else "—"),
             (self.t("d_net"), row.get("net") or "—"),
             (self.t("d_data"), f'↓{fmt_short(row["down_total"])}  ↑{fmt_short(row["up_total"])}'),
         ]
@@ -2534,7 +2768,15 @@ class ConnWidget:
     def _persist(self):
         self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
         self.cfg["win_w"] = int(self.W)
-        save_cfg(self.cfg)
+        ok = save_cfg(self.cfg)
+        if self._save_notifier.note(ok, LAST_SAVE_ERROR):
+            self._save_error = self.t("save_fail", path=CONFIG_FILE)
+            self._settings_error = self._save_error
+            self._toast(self._settings_error)
+        elif ok:
+            if self._save_error and self._settings_error == self._save_error:
+                self._settings_error = ""
+            self._save_error = ""
 
     def _persist_later(self):
         try:
@@ -2788,6 +3030,11 @@ class ConnWidget:
             w.bind("<Button-1>", self._set_drag_start)
             w.bind("<B1-Motion>", self._set_drag)
 
+        if getattr(self, "_settings_error", ""):
+            tk.Label(outer, text=self._settings_error, bg=c["bg"], fg=c["err"],
+                     font=self.f_small, anchor="w", justify="left",
+                     wraplength=S(560)).pack(fill="x", padx=S(16), pady=(0, S(4)))
+
         body = tk.Frame(outer, bg=c["bg"])
         body.pack(fill="both", expand=True, padx=S(16), pady=(0, S(12)))
         body.grid_columnconfigure(0, weight=1, minsize=S(320))
@@ -3026,12 +3273,10 @@ class ConnWidget:
 
         def work():
             r = probe_api(api, secret, 3.0)
-            if r:
-                self.root.after(0, lambda: self.test_lbl.configure(
-                    text=self.t("test_ok", ver=r[1]), fg=self.c["ok"]))
-            else:
-                self.root.after(0, lambda: self.test_lbl.configure(
-                    text=self.t("test_fail", msg=api or "-"), fg=self.c["err"]))
+            text = format_probe_result(r, self.cfg.get("lang", "zh"))
+            ok = bool(r and r[0])
+            fg = self.c["ok"] if ok else self.c["err"]
+            self.root.after(0, lambda: self.test_lbl.configure(text=text, fg=fg))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -3144,16 +3389,24 @@ class ConnWidget:
 
     # ------------------------------------------------------------ 托盘
     def _init_tray(self):
+        self.hotkey_ok = False
         try:
             self.tray = TrayIcon(self.root, res_path("app.ico"),
                                  self._tray_toggle, self._tray_menu)
             self.tray.on_maximize = self.toggle_collapse
             try:
-                self.tray.register_hotkey(self._tray_toggle)
+                self.hotkey_ok = bool(self.tray.register_hotkey(self._tray_toggle))
             except Exception:
-                pass
+                self.hotkey_ok = False
+            # 非 Windows 没有 RegisterHotKey，失败是预期行为，不要误报。
+            if sys.platform == "win32":
+                msg = hotkey_fail_message(self.hotkey_ok, self.cfg.get("lang", "zh"))
+                if msg:
+                    # 热键提示是 Tk 操作，等 mainloop 启动后在 Tk 线程里显示一次。
+                    self.root.after(800, lambda: self._toast(msg))
         except Exception:
             self.tray = None
+            self.hotkey_ok = False
 
     def _tray_toggle(self):
         if self.root.state() == "withdrawn":
@@ -3178,8 +3431,7 @@ class ConnWidget:
             m.add_command(label=self.t("menu_open"), command=self.open_panel)
             m.add_separator()
             m.add_command(label=self.t("tray_quit"), command=self.quit_app)
-            self._ctx_menu = m
-            m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+            self._popup_menu(m, self.root.winfo_pointerx(), self.root.winfo_pointery())
         except Exception:
             pass
 
@@ -3279,14 +3531,64 @@ class ConnWidget:
 _mutex = None
 
 
+def mutex_means_first_instance(last_error):
+    """只有 ERROR_ALREADY_EXISTS(183) 表示已有实例。"""
+    return last_error != 183
+
+
 def single_instance():
     global _mutex
     try:
-        k = ctypes.windll.kernel32
+        # 必须用 use_last_error=True 的 WinDLL，GetLastError 才不会被 ctypes
+        # 自身的调用覆盖；调用前清零，之后只读这份线程局部错误码。
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        ctypes.set_last_error(0)
         _mutex = k.CreateMutexW(None, False, "Local\\ClashConnWidget_v2")
-        return k.GetLastError() != 183
+        return mutex_means_first_instance(ctypes.get_last_error())
     except Exception:
         return True
+
+
+def is_widget_title(title):
+    """原标题，或 native 速率模式下的「↓… ↑… · APP_NAME」标题。"""
+    if not isinstance(title, str):
+        return False
+    return title == APP_NAME or title.endswith(f" · {APP_NAME}")
+
+
+def find_widget_hwnd(enum_windows, get_window_text):
+    """枚举窗口并返回第一个本程序窗口；无匹配返回 0。"""
+    found = []
+
+    def _on_window(hwnd, _lparam):
+        try:
+            title = get_window_text(hwnd)
+        except Exception:
+            return True
+        if is_widget_title(title):
+            found.append(hwnd)
+            return False
+        return True
+
+    try:
+        enum_windows(_on_window, 0)
+    except Exception:
+        pass
+    return found[0] if found else 0
+
+
+def _enum_windows(callback, lparam):
+    user32 = ctypes.windll.user32
+    proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    return user32.EnumWindows(proc(callback), lparam)
+
+
+def _get_window_text(hwnd):
+    user32 = ctypes.windll.user32
+    length = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
 
 
 def main():
@@ -3297,9 +3599,9 @@ def main():
     args = ap.parse_args()
 
     if not single_instance():
-        # 已有实例：把它叫到前台
+        # 已有实例：按动态标题找到它并叫到前台
         try:
-            hwnd = ctypes.windll.user32.FindWindowW(None, APP_NAME)
+            hwnd = find_widget_hwnd(_enum_windows, _get_window_text)
             if hwnd:
                 ctypes.windll.user32.ShowWindow(hwnd, 5)
                 ctypes.windll.user32.SetForegroundWindow(hwnd)
