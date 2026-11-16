@@ -80,6 +80,7 @@ DEFAULT_CFG = {
     "sort_desc": True,
     "col_w": None,
     "win_w": None,
+    "win_h": None,
     "x": None,
     "y": None,
     "first_run_done": False,
@@ -171,7 +172,7 @@ I18N = {
         "menu_open": "打开 Clash 面板", "menu_copy": "复制全部主机名",
         "menu_top": "窗口置顶", "menu_collapse": "折叠 / 展开", "menu_colw": "重置列宽",
         "menu_winw": "重置窗口宽度", "menu_interval": "刷新频率", "menu_settings": "设置…",
-        "menu_search": "搜索…", "menu_quit": "退出",
+        "menu_search": "搜索…", "menu_quit": "退出", "search_btn": "⌕ 搜索",
         "set_title": "设置",
         "set_appearance": "外观", "set_list": "列表", "set_behavior": "行为",
         "set_conn": "后台连接", "set_lang": "语言", "set_about": "关于",
@@ -227,7 +228,7 @@ I18N = {
         "menu_top": "Always on top", "menu_collapse": "Collapse / expand",
         "menu_colw": "Reset column widths", "menu_winw": "Reset window width",
         "menu_interval": "Refresh rate", "menu_settings": "Settings…",
-        "menu_search": "Search…", "menu_quit": "Quit",
+        "menu_search": "Search…", "menu_quit": "Quit", "search_btn": "⌕ Search",
         "set_title": "Settings",
         "set_appearance": "Appearance", "set_list": "List", "set_behavior": "Behavior",
         "set_conn": "Backend", "set_lang": "Language", "set_about": "About",
@@ -401,6 +402,8 @@ def load_cfg() -> dict:
         cfg["view"] = "conn"
     if cfg.get("curve") not in ("60", "300", "1800"):
         cfg["curve"] = "60"
+    if not isinstance(cfg.get("win_h"), (int, float)):
+        cfg["win_h"] = None
     if not isinstance(cfg.get("show_cols"), dict):
         cfg["show_cols"] = {"rule": False, "src": False, "net": False}
     for k in ("rule", "src", "net"):
@@ -1194,8 +1197,10 @@ class ConnWidget:
             return self.HEAD_H + self.MINI_H
         top = self._top_h()
         if self.cfg["rows"] == "all":
-            return max(top + self.HEADER_H + self.ROW_H * 4,
-                       int(self.root.winfo_screenheight() * 0.66))
+            h = self.cfg.get("win_h")
+            if not isinstance(h, (int, float)) or h < top + self.HEADER_H + self.ROW_H * 3:
+                h = top + self.HEADER_H + self.ROW_H * 10 + self.S(2)
+            return int(min(h, self.root.winfo_screenheight() * 0.92))
         return top + self.HEADER_H + self.n_rows * self.ROW_H + self.S(2)
 
     # ------------------------------------------------------------ 布局
@@ -1240,13 +1245,6 @@ class ConnWidget:
         self.btn_min.bind("<Button-1>", lambda e: self.toggle_collapse())
         self.btn_min.bind("<Enter>", lambda e: self.btn_min.configure(fg=c["title"]))
         self.btn_min.bind("<Leave>", lambda e: self.btn_min.configure(fg=c["sub"]))
-
-        self.btn_search = tk.Label(head, text="⌕", bg=c["bg"], fg=c["sub"], font=self.f_ui,
-                                   width=2, cursor="hand2")
-        self.btn_search.pack(side="right", padx=(0, S(2)))
-        self.btn_search.bind("<Button-1>", lambda e: self.toggle_search())
-        self.btn_search.bind("<Enter>", lambda e: self.btn_search.configure(fg=c["title"]))
-        self.btn_search.bind("<Leave>", lambda e: self.btn_search.configure(fg=c["sub"]))
 
         self.lbl_up = tk.Label(head, text="↑ 0/s", bg=c["bg"], fg=c["up"], font=self.f_num)
         self.lbl_up.pack(side="right", padx=(S(7), S(6)))
@@ -1355,6 +1353,17 @@ class ConnWidget:
             lb.bind("<Button-1>", lambda e, k=key: self.set_view(k))
             self.tab_labels[key] = lb
 
+        btn = tk.Label(self.tabs, text=self.t("search_btn"), font=self.f_ui,
+                       bg=c["chip_on_bg"] if self.search_open else c["chip_bg"],
+                       fg=c["chip_on_fg"] if self.search_open else c["chip_fg"],
+                       cursor="hand2", padx=self.S(10), pady=self.S(1))
+        btn.pack(side="right", padx=(0, self.S(8)), pady=self.S(2))
+        btn.bind("<Button-1>", lambda e: self.toggle_search())
+        btn.bind("<Enter>", lambda e: btn.configure(bg=c["chip_hover"]))
+        btn.bind("<Leave>", lambda e: btn.configure(
+            bg=c["chip_on_bg"] if self.search_open else c["chip_bg"]))
+        self.btn_search = btn
+
     def set_view(self, key):
         if key not in ("conn", "node", "device"):
             return
@@ -1450,6 +1459,13 @@ class ConnWidget:
             g.bind("<Enter>", lambda e, w=g: w.configure(bg=self.c["chip_hover"]))
             g.bind("<Leave>", lambda e, w=g: w.configure(bg=self.c["bg"]))
             self._grips.append((side, g))
+        gb = tk.Frame(self.root, bg=self.c["bg"], cursor="sb_v_double_arrow")
+        gb.bind("<Button-1>", self._start_hresize)
+        gb.bind("<B1-Motion>", self._resize_h)
+        gb.bind("<ButtonRelease-1>", self._end_hresize)
+        gb.bind("<Enter>", lambda e, w=gb: w.configure(bg=self.c["chip_hover"]))
+        gb.bind("<Leave>", lambda e, w=gb: w.configure(bg=self.c["bg"]))
+        self._grips.append(("bottom", gb))
         self._place_grips()
 
     def _place_grips(self):
@@ -1458,9 +1474,46 @@ class ConnWidget:
         h = self._win_h()
         gw = self.S(4)
         for side, g in self._grips:
+            if side == "bottom":
+                if self.cfg["collapsed"] or self.cfg.get("mini"):
+                    g.place_forget()
+                else:
+                    g.place(x=self.S(8), y=max(1, h - gw - 1),
+                            width=max(10, self.W - self.S(16)), height=gw)
+                    g.lift()
+                continue
             x = 1 if side == "left" else max(1, self.W - gw - 1)
             g.place(x=x, y=1, width=gw, height=max(4, h - 2))
             g.lift()
+
+    def _start_hresize(self, e):
+        if self.cfg["rows"] != "all":
+            self.cfg["rows"] = "all"
+            self.cfg["win_h"] = int(self.root.winfo_height())
+            self._refresh_settings()
+        self._hresz = {"y": e.y_root, "h": self.root.winfo_height()}
+        return "break"
+
+    def _resize_h(self, e):
+        d = getattr(self, "_hresz", None)
+        if not d:
+            return "break"
+        top = self._top_h()
+        min_h = top + self.HEADER_H + self.ROW_H * 3
+        max_h = int(self.root.winfo_screenheight() * 0.92)
+        h = max(min_h, min(d["h"] + (e.y_root - d["y"]), max_h))
+        self.cfg["win_h"] = int(h)
+        self.root.geometry(f"{self.W}x{h}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        self._place_grips()
+        self._redraw()
+        return "break"
+
+    def _end_hresize(self, e):
+        if getattr(self, "_hresz", None):
+            self._hresz = None
+            self._persist()
+            self._refresh_settings()
+        return "break"
 
     def _place_window(self):
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -1481,7 +1534,7 @@ class ConnWidget:
         self.root.after(20, self._round_corners)
 
     def _layout_header(self):
-        """窗口较窄时依次隐藏 计数 / IP / 配置档 胶囊。"""
+        """窗口较窄时依次隐藏：计数 → 配置档；IP 胶囊有筛选时永不隐藏。"""
         try:
             avail = self.head.winfo_width() - 4
         except Exception:
@@ -1493,11 +1546,18 @@ class ConnWidget:
         need = lambda: sum(w.winfo_reqwidth() for w in
                            (self.lbl_dot, self.lbl_title, self.lbl_count, self.lbl_ip,
                             self.lbl_prof, self.lbl_down, self.lbl_up, self.btn_min,
-                            self.btn_set, self.btn_close, self.btn_search))
-        for w in (self.lbl_count, self.lbl_ip, self.lbl_prof):
-            if need() + self.S(60) <= avail:
+                            self.btn_set, self.btn_close))
+        filtering = bool(self.cfg.get("filter_ip"))
+        order = ([self.lbl_prof, self.lbl_count] if filtering
+                 else [self.lbl_count, self.lbl_prof, self.lbl_ip])
+        for w in order:
+            if need() + self.S(40) <= avail:
                 break
             w.pack_forget()
+        if filtering and need() + self.S(20) > avail:
+            self.lbl_title.pack_forget()
+        else:
+            self.lbl_title.pack(side="left")
 
     # ------------------------------------------------------------ 绘制
     def _extra_keys(self):
@@ -2114,7 +2174,10 @@ class ConnWidget:
         self._refresh_settings()
 
     def set_rows(self, v):
+        cur_h = self.root.winfo_height()
         self.cfg["rows"] = v
+        if v == "all" and cur_h > 100:
+            self.cfg["win_h"] = int(cur_h)      # 切到「不限」不改窗口高度，改为可滚动
         self.scroll = 0
         self._apply_geometry()
         self._persist()
@@ -2507,6 +2570,7 @@ class ConnWidget:
             self.lbl_up.configure(text="↑ --")
         if self.cfg.get("mini"):
             self._update_mini()
+        self._layout_header()
         self._redraw()
 
     # ------------------------------------------------------------ 设置
